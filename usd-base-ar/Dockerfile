@@ -54,7 +54,10 @@ RUN set -eux; \
 	echo "add_subdirectory(usdInteractive)" >> usdsrc/pxr/usd/CMakeLists.txt; \
 	# Rebuild USD into the same prefix. Third-party dependencies already present
 	# in the prefix are detected and skipped by build_usd.py.
+	# PXR_PYTHON_INSTALL_DIR must match usd-base so the bindings stay at
+	# lib/python (OpenUSD 26.08 defaults to lib/pythonX.Y/site-packages).
 	python3 usdsrc/build_scripts/build_usd.py \
+		--build-args USD,"-DPXR_PYTHON_INSTALL_DIR=lib/python" \
 		--no-examples \
 		--no-tutorials \
 		--no-imaging \
@@ -64,6 +67,7 @@ RUN set -eux; \
 		"${USD_BUILD_PATH}"; \
 	rm -rf usdsrc; \
 	rm -rf "/usr/src/app/${USD_SCHEMA_FOLDER}"; \
+	python3 -c "from pxr import Usd, UsdInteractive; print(Usd.GetVersion())"; \
 	rm -rf \
 		"${USD_BUILD_PATH}/build" \
 		"${USD_BUILD_PATH}/share" \

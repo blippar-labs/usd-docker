@@ -23,7 +23,7 @@ docker pull ghcr.io/blippar-labs/usd-base:26.08
 | `USD_BIN_PATH` | `${USD_BUILD_PATH}/bin`, appended to `PATH` |
 | `USD_LIB_PATH` | `${USD_BUILD_PATH}/lib`, also set as `LD_LIBRARY_PATH` |
 | `USD_PLUGIN_PATH` | `${USD_BUILD_PATH}/plugin/usd` |
-| `PYTHONPATH` | `${USD_LIB_PATH}/python` |
+| `PYTHONPATH` | `${USD_LIB_PATH}/python` (pinned via `PXR_PYTHON_INSTALL_DIR`; OpenUSD 26.08+ would otherwise use `lib/pythonX.Y/site-packages`) |
 
 ## Build arguments
 

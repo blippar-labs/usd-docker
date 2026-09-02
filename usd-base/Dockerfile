@@ -52,7 +52,11 @@ RUN set -eux; \
 	pip3 install --no-cache-dir --upgrade Jinja2 numpy; \
 	mkdir -p xrutils; \
 	git clone --branch "v${USD_VERSION}" --depth 1 https://github.com/PixarAnimationStudios/OpenUSD.git usdsrc; \
+	# PXR_PYTHON_INSTALL_DIR keeps the Python bindings at lib/python. OpenUSD
+	# 26.08 changed the default to lib/pythonX.Y/site-packages; older releases
+	# ignore the variable (it is only an unused-variable CMake warning there).
 	python3 usdsrc/build_scripts/build_usd.py \
+		--build-args USD,"-DPXR_PYTHON_INSTALL_DIR=lib/python" \
 		--no-examples \
 		--no-tutorials \
 		--no-imaging \
@@ -61,6 +65,9 @@ RUN set -eux; \
 		--no-materialx \
 		"${USD_BUILD_PATH}"; \
 	rm -rf usdsrc; \
+	# The bindings must be importable via the PYTHONPATH exported above;
+	# derived images (usdGenSchema in usd-base-ar) depend on it.
+	python3 -c "from pxr import Usd; print(Usd.GetVersion())"; \
 	# Drop intermediate build artifacts. pxrConfig.cmake and cmake/ are kept on
 	# purpose so derived images can build plugins against this install.
 	rm -rf \
