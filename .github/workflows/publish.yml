@@ -1,0 +1,364 @@
+name: publish images
+
+# Builds usd-base and then usd-base-ar (on top of the freshly built usd-base)
+# for linux/amd64 and linux/arm64 and publishes multi-arch manifests to GHCR.
+#
+#   ghcr.io/<owner>/usd-base:<usd_version>
+#   ghcr.io/<owner>/usd-base-ar:<usd_version>
+#
+# When the built version is the newest upstream OpenUSD release, both images
+# are also tagged :latest.
+#
+# Triggers:
+#   - Manual dispatch with an explicit OpenUSD version: always builds.
+#   - Manual dispatch with "latest" (the default), or the weekly schedule:
+#     resolves the newest upstream release and builds it only if that tag is
+#     not already present in the registry (tick force_rebuild to override).
+
+on:
+  workflow_dispatch:
+    inputs:
+      usd_version:
+        description: 'OpenUSD version to build (e.g. 26.08), or "latest" to resolve the newest upstream release.'
+        required: false
+        default: 'latest'
+        type: string
+      force_rebuild:
+        description: 'Rebuild and republish even if this version already exists in the registry.'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Every Monday at 03:00 UTC. Picks up new OpenUSD releases automatically.
+    - cron: '0 3 * * 1'
+
+env:
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      usd_version: ${{ steps.derive.outputs.usd_version }}
+      tag_latest:  ${{ steps.derive.outputs.tag_latest }}
+      skip:        ${{ steps.derive.outputs.skip }}
+      base_image:  ${{ steps.derive.outputs.base_image }}
+      ar_image:    ${{ steps.derive.outputs.ar_image }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: derive build parameters
+        id: derive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED: ${{ inputs.usd_version || 'latest' }}
+          FORCE: ${{ inputs.force_rebuild || 'false' }}
+        run: |
+          set -euo pipefail
+
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          base_image="${REGISTRY}/${owner}/usd-base"
+          ar_image="${REGISTRY}/${owner}/usd-base-ar"
+
+          latest_version="$(scripts/resolve-version.sh latest)"
+          usd_version="$(scripts/resolve-version.sh "${REQUESTED}")"
+
+          tag_latest="false"
+          if [[ "${usd_version}" == "${latest_version}" ]]; then
+            tag_latest="true"
+          fi
+
+          exists() {
+            docker buildx imagetools inspect "$1" >/dev/null 2>&1
+          }
+          already_published="false"
+          if exists "${base_image}:${usd_version}" && exists "${ar_image}:${usd_version}"; then
+            already_published="true"
+          fi
+
+          skip="false"
+          if [[ "${REQUESTED}" == "latest" && "${already_published}" == "true" && "${FORCE}" != "true" ]]; then
+            skip="true"
+          fi
+
+          {
+            echo "usd_version=${usd_version}"
+            echo "tag_latest=${tag_latest}"
+            echo "skip=${skip}"
+            echo "base_image=${base_image}"
+            echo "ar_image=${ar_image}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### OpenUSD ${usd_version}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| requested | \`${REQUESTED}\` |"
+            echo "| resolved version | \`${usd_version}\` |"
+            echo "| newest upstream release | \`${latest_version}\` |"
+            echo "| already in registry | ${already_published} |"
+            echo "| tag :latest | ${tag_latest} |"
+            echo "| action | $([[ "${skip}" == "true" ]] && echo 'skip (already published)' || echo 'build and publish') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-base:
+    name: build usd-base (${{ matrix.platform }})
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner:   ubuntu-latest
+          - platform: linux/arm64
+            runner:   ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: prepare platform pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - name: free runner disk space
+        # OpenUSD builds are large. Drop toolchains preinstalled on hosted
+        # runners that this build never uses.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: usd-base
+          file: usd-base/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            USD_VERSION=${{ needs.resolve.outputs.usd_version }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.resolve.outputs.usd_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          outputs: type=image,name=${{ needs.resolve.outputs.base_image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: export digest
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-base:
+    name: publish usd-base manifest
+    needs: [resolve, build-base]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: base-digests-*
+          merge-multiple: true
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          image="${{ needs.resolve.outputs.base_image }}"
+          tags=(-t "${image}:${{ needs.resolve.outputs.usd_version }}")
+          if [[ "${{ needs.resolve.outputs.tag_latest }}" == "true" ]]; then
+            tags+=(-t "${image}:latest")
+          fi
+          # shellcheck disable=SC2046
+          docker buildx imagetools create "${tags[@]}" $(printf "${image}@sha256:%s " *)
+
+      - name: resolve manifest digest
+        id: digest
+        run: |
+          set -euo pipefail
+          ref="${{ needs.resolve.outputs.base_image }}:${{ needs.resolve.outputs.usd_version }}"
+          digest="$(docker buildx imagetools inspect "${ref}" --format '{{ .Manifest.Digest }}')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "usd-base published as ${ref} (${digest})"
+          docker buildx imagetools inspect "${ref}"
+
+  build-ar:
+    name: build usd-base-ar (${{ matrix.platform }})
+    needs: [resolve, merge-base]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner:   ubuntu-latest
+          - platform: linux/arm64
+            runner:   ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: prepare platform pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - name: free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: usd-base-ar
+          file: usd-base-ar/Dockerfile
+          platforms: ${{ matrix.platform }}
+          # Pin to the exact usd-base manifest published earlier in this run.
+          build-args: |
+            BASE_IMAGE=${{ needs.resolve.outputs.base_image }}@${{ needs.merge-base.outputs.digest }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.resolve.outputs.usd_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.base.name=${{ needs.resolve.outputs.base_image }}:${{ needs.resolve.outputs.usd_version }}
+            org.opencontainers.image.base.digest=${{ needs.merge-base.outputs.digest }}
+          outputs: type=image,name=${{ needs.resolve.outputs.ar_image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: export digest
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ar-digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-ar:
+    name: publish usd-base-ar manifest
+    needs: [resolve, build-ar]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: ar-digests-*
+          merge-multiple: true
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          image="${{ needs.resolve.outputs.ar_image }}"
+          tags=(-t "${image}:${{ needs.resolve.outputs.usd_version }}")
+          if [[ "${{ needs.resolve.outputs.tag_latest }}" == "true" ]]; then
+            tags+=(-t "${image}:latest")
+          fi
+          # shellcheck disable=SC2046
+          docker buildx imagetools create "${tags[@]}" $(printf "${image}@sha256:%s " *)
+
+      - name: inspect
+        run: |
+          set -euo pipefail
+          ref="${{ needs.resolve.outputs.ar_image }}:${{ needs.resolve.outputs.usd_version }}"
+          docker buildx imagetools inspect "${ref}"
+          {
+            echo "### Published"
+            echo
+            echo "- \`${{ needs.resolve.outputs.base_image }}:${{ needs.resolve.outputs.usd_version }}\`"
+            echo "- \`${ref}\`"
+            if [[ "${{ needs.resolve.outputs.tag_latest }}" == "true" ]]; then
+              echo "- both also tagged \`:latest\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
